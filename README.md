@@ -210,3 +210,8 @@ Results of PTQ4ViT
     year={2022},
 }
 ```
+## Acknowledgement
+
+This project is based on [PTQ4ViT](https://github.com/hahnyuan/PTQ4ViT) and other related open-source projects.  
+We sincerely thank the original authors for their valuable work.  
+This project follows the MIT License of the original work.
