@@ -247,7 +247,7 @@ class HessianQuantCalibrator(QuantCalibrator):
             if isinstance(module, MinMaxQuantMatMul):
                 hooks.append(module.register_forward_hook(matmul_forward_hook))
             if hasattr(module, "metric") and module.metric == "hessian":
-                hooks.append(module.register_backward_hook(grad_hook))
+                hooks.append(module.register_full_backward_hook(grad_hook))
             
             # feed in calibration data, and store the data
             for inp, target in self.calib_loader:
@@ -327,7 +327,7 @@ class HessianQuantCalibrator(QuantCalibrator):
             if isinstance(module, MinMaxQuantMatMul):
                 hooks.append(module.register_forward_hook(matmul_forward_hook))
             if hasattr(module, "metric"):
-                hooks.append(module.register_backward_hook(grad_hook))
+                hooks.append(module.register_full_backward_hook(grad_hook))
             
             # feed in calibration data, and store the data
             for inp, target in self.calib_loader:
