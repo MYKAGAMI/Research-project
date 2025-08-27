@@ -7,18 +7,13 @@ from timm.models import vision_transformer
 from timm.models.vision_transformer import Attention
 from timm.models.swin_transformer import WindowAttention
 
-def attention_forward(self, x, attn_mask=None):
+def attention_forward(self, x):
     B, N, C = x.shape
     qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
     q, k, v = qkv.unbind(0)   # make torchscript happy (cannot use tensor as tuple)
 
     # attn = (q @ k.transpose(-2, -1)) * self.scale
     attn = self.matmul1(q, k.transpose(-2, -1)) * self.scale
-    
-    # 处理注意力掩码
-    if attn_mask is not None:
-        attn = attn + attn_mask
-    
     attn = attn.softmax(dim=-1)
     attn = self.attn_drop(attn)
     del q, k
@@ -30,7 +25,7 @@ def attention_forward(self, x, attn_mask=None):
     x = self.proj_drop(x)
     return x
 
-def window_attention_forward(self, x, mask=None):
+def window_attention_forward(self, x, mask = None):
     B_, N, C = x.shape
     qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
     q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
