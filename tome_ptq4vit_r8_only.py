@@ -9,9 +9,8 @@ from importlib import reload, import_module
 import os
 import time
 import timm
-import tome  # Import ToMe
-import types  # For method replacement
-
+import tome  
+import types  
 import utils.datasets as datasets
 import utils.net_wrap as net_wrap
 from utils.quant_calib import QuantCalibrator, HessianQuantCalibrator
