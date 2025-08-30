@@ -1,29 +1,13 @@
 """
-ptq4vit_qdq_export.py
----------------------
+ptq4vit_qdq_export.py  (per-tensor weight Q/DQ export)
+-----------------------------------------------------
 Export a ViT/DeiT model, calibrated by PTQ4ViT, into an ONNX graph with explicit
-QuantizeLinear/DequantizeLinear (Q/DQ). This lets TensorRT run REAL INT8 kernels
-on H100 while preserving (as much as possible) the quantization ranges learned by
-your PTQ4ViT pipeline.
+QuantizeLinear/DequantizeLinear (Q/DQ). We use per-tensor weight quantization
+to keep ONNX export compatible (PyTorch exporter does not support
+aten::quantize_per_channel to ONNX directly in many versions/opsets).
 
-Usage (from your eval script, after PTQ4ViT calibration):
-    from ptq4vit_qdq_export import export_qdq_onnx_from_model
-
-    onnx_path = export_qdq_onnx_from_model(
-        model=net,                               # the calibrated model (after wrap + calibrate)
-        calib_loader=calib_loader,               # small loader for activation fallback if needed
-        use_symmetric_weight=True,               # typical for weights
-        use_symmetric_act=False,                 # typical to allow ZP for activations
-        input_size=224,                          # 224 or 384
-        onnx_path="vit_ptq4vit_qdq.onnx"
-    )
-
-Notes:
-- We try to grab quantization params from PTQ4ViT-wrapped modules if available.
-  If not found, we FALL BACK to min/max calibration collected via forward hooks.
-- We replace nn.Linear with a QDQLinearExport which inserts Q/DQ ops around
-  inputs & weights for ONNX. Forward still runs in fp32 for correctness.
-- ONNX opset >= 13 recommended.
+This yields REAL INT8 execution in TensorRT/H100 while preserving
+PTQ4ViT calibration as much as possible.
 
 Author: ChatGPT (GPT-5 Thinking)
 """
@@ -39,51 +23,45 @@ import torch.nn.functional as F
 class QDQLinearExport(nn.Module):
     """
     A wrapper around nn.Linear that injects QuantizeLinear/DequantizeLinear
-    around inputs and weights during ONNX export by using aten::quantize_per_* ops.
-    Runtime in PyTorch remains fp32 (fake), but ONNX consumers (TensorRT) can fuse
+    around inputs (uint8 affine) and weights (int8 per-tensor) during ONNX export
+    by using aten::quantize_per_tensor/aten::dequantize ops.
+
+    Runtime in PyTorch remains fp32; ONNX consumers (e.g., TensorRT) can fuse
     Q/DQ into real INT8 kernels.
     """
     def __init__(
         self,
         linear: nn.Linear,
-        w_scales: torch.Tensor,     # per-channel or per-tensor weight scales (float32)
-        w_zero_points: torch.Tensor,# same shape as w_scales, usually zeros for symmetric
+        w_scale: float,             # per-tensor weight scale
+        w_zero_point: int,          # usually 0 for symmetric int8 weights
         a_scale: float,             # per-tensor activation scale
-        a_zero_point: int,          # per-tensor activation zp
-        per_channel: bool = True
+        a_zero_point: int           # e.g., 128 for uint8 affine
     ):
         super().__init__()
         self.inner = nn.Linear(linear.in_features, linear.out_features, bias=linear.bias is not None)
-        # Copy weights/bias to avoid tying original params (safe for export)
         with torch.no_grad():
             self.inner.weight.copy_(linear.weight)
             if linear.bias is not None:
                 self.inner.bias.copy_(linear.bias)
 
         # register buffers for constant folding & ONNX export
-        self.register_buffer("w_scales", w_scales.float())
-        self.register_buffer("w_zero_points", w_zero_points.int())
+        self.register_buffer("w_scale", torch.tensor([w_scale], dtype=torch.float32))
+        self.register_buffer("w_zero_point", torch.tensor([w_zero_point], dtype=torch.int32))
         self.register_buffer("a_scale", torch.tensor([a_scale], dtype=torch.float32))
         self.register_buffer("a_zero_point", torch.tensor([a_zero_point], dtype=torch.int32))
 
-        self.per_channel = per_channel
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Insert Q/DQ on activation (per-tensor, uint8 by default for activations)
-        # NOTE: quantize_per_tensor expects zero_point dtype to match qdtype
-        a_q = torch.quantize_per_tensor(x, float(self.a_scale.item()), int(self.a_zero_point.item()), torch.quint8)
+        # Activation Q/DQ (uint8 affine)
+        a_q = torch.quantize_per_tensor(
+            x, float(self.a_scale.item()), int(self.a_zero_point.item()), torch.quint8
+        )
         a_dq = torch.dequantize(a_q)
 
-        # Insert Q/DQ on weight (per-channel qint8 along out_features=0)
+        # Weight Q/DQ (int8 per-tensor, symmetric)
         W = self.inner.weight
-        if self.per_channel:
-            # torch.quantize_per_channel requires scales/zero_points of shape [out_features]
-            # axis=0 => per output channel
-            w_q = torch.quantize_per_channel(
-                W, self.w_scales, self.w_zero_points, axis=0, dtype=torch.qint8
-            )
-        else:
-            w_q = torch.quantize_per_tensor(W, float(self.w_scales.item()), int(self.w_zero_points.item()), torch.qint8)
+        w_q = torch.quantize_per_tensor(
+            W, float(self.w_scale.item()), int(self.w_zero_point.item()), torch.qint8
+        )
         w_dq = torch.dequantize(w_q)
 
         return F.linear(a_dq, w_dq, self.inner.bias)
@@ -104,12 +82,6 @@ def _set_module_by_name(root: nn.Module, name: str, new_m: nn.Module):
     for p in parts[:-1]:
         parent = getattr(parent, p)
     setattr(parent, parts[-1], new_m)
-
-def _get_parent_name(name: str) -> Tuple[str, str]:
-    parts = name.split(".")
-    parent_name = ".".join(parts[:-1])
-    child_name = parts[-1]
-    return parent_name, child_name
 
 
 # ------------------ Collect activation stats via forward hooks -----------------
@@ -154,68 +126,52 @@ def _collect_activation_ranges(model: nn.Module, calib_loader, linear_names, dev
 
 # -------------------- Extract qparams from PTQ4ViT wrappers --------------------
 
-def _try_ptq4vit_qparams(wrapped_modules: Dict[str, nn.Module], name: str, W: torch.Tensor):
+def _try_ptq4vit_qparams(wrapped_modules: Dict[str, nn.Module], name: str):
     """
-    Heuristic extraction of PTQ4ViT quant params from wrapper module.
-    Returns (w_scales[OC], w_zero_points[OC], act_scale, act_zero_point) or None if not found.
+    Heuristic extraction of PTQ4ViT qparams from wrapper module.
+    Returns (w_scale_tensor_or_scalar, a_scale_scalar) if possible, else None.
+    NOTE: We'll convert weight scale to a single per-tensor scale later.
     """
     m = wrapped_modules.get(name, None)
     if m is None:
         return None
 
-    # Try common field names (best-effort; adjust if your PTQ4ViT wrappers differ)
-    # We prefer symmetric weight int8 => zp=0, per-channel on out_features
-    OC = W.shape[0]
-    w_scales = None
+    w_scale = None
     a_scale = None
 
-    # weight scales candidates
     for cand in ["w_scale", "weight_scale", "w_scales", "weight_scales"]:
         if hasattr(m, cand):
-            ws = getattr(m, cand)
-            ws = torch.as_tensor(ws, dtype=torch.float32)
-            if ws.numel() == OC:
-                w_scales = ws
-                break
-            elif ws.numel() == 1:
-                w_scales = ws.repeat(OC)
-                break
-
-    # activation scale candidates
+            w_scale = getattr(m, cand)
+            break
     for cand in ["a_scale", "act_scale", "x_scale"]:
         if hasattr(m, cand):
             a_scale = float(torch.as_tensor(getattr(m, cand)).float().item())
             break
 
-    if w_scales is None and hasattr(m, "w_clip"):  # e.g., symmetric max => scale = max/127
-        w_max = getattr(m, "w_clip")
-        w_scales = torch.full((OC,), float(w_max)/127.0, dtype=torch.float32)
+    if (w_scale is None) and hasattr(m, "w_clip"):
+        # symmetric max => scale ≈ max/127  (rough heuristic)
+        w_max = float(getattr(m, "w_clip"))
+        w_scale = torch.tensor([w_max / 127.0], dtype=torch.float32)
 
-    if a_scale is None and hasattr(m, "a_clip"):
-        a_scale = float(getattr(m, "a_clip"))/255.0  # assuming uint8 affine
+    if (a_scale is None) and hasattr(m, "a_clip"):
+        a_scale = float(getattr(m, "a_clip")) / 255.0  # assuming uint8 affine
 
-    if (w_scales is None) or (a_scale is None):
+    if (w_scale is None) or (a_scale is None):
         return None
-
-    w_zero_points = torch.zeros_like(w_scales, dtype=torch.int32)  # symmetric weight
-    a_zero_point  = 128  # assume affine uint8; adjust if symmetric desired
-
-    return (w_scales, w_zero_points, a_scale, a_zero_point)
+    return w_scale, a_scale
 
 
 # --------------- Fallback: compute qparams from min/max statistics ------------
 
-def _symmetric_scale_per_channel(W: torch.Tensor, qmax: int = 127) -> torch.Tensor:
-    # per output-channel (dim=0) scale = max(|W_i|) / qmax
-    OC = W.shape[0]
-    Wc = W.detach().abs().amax(dim=1) if W.dim() == 2 else W.detach().abs().amax(dim=(1,2,3))
-    # Ensure shape [OC]
-    Wc = Wc.reshape(OC)
-    scales = (Wc / qmax).clamp(min=1e-12).to(torch.float32)
-    return scales
+def _symmetric_weight_scale_per_tensor(W: torch.Tensor, qmax: int = 127) -> float:
+    # per-tensor symmetric: scale = max(|W|)/qmax
+    m = float(W.detach().abs().amax().cpu().item())
+    if m < 1e-12:
+        m = 1e-12
+    return m / qmax
 
 def _affine_scale_zero(min_val: float, max_val: float, qmin: int = 0, qmax: int = 255):
-    # per-tensor affine
+    # per-tensor affine for activations
     rng = max_val - min_val
     if rng < 1e-12:
         rng = 1e-12
@@ -236,28 +192,35 @@ def _replace_linears_with_qdq(model: nn.Module,
     for name, lin in linears.items():
         W = lin.weight.detach().cpu()
 
-        # 1) Try to get PTQ4ViT-provided qparams from wrapper
-        wscale, wzp, ascale, azp = None, None, None, None
+        # Try to reuse PTQ4ViT qparams if present (then collapse weight scales to per-tensor)
+        w_scale_tensor = None
+        a_scale = None
         if wrapped_modules is not None:
-            got = _try_ptq4vit_qparams(wrapped_modules, name, W)
+            got = _try_ptq4vit_qparams(wrapped_modules, name)
             if got is not None:
-                wscale, wzp, ascale, azp = got
+                w_scale_tensor, a_scale = got
+                w_scale_tensor = torch.as_tensor(w_scale_tensor, dtype=torch.float32).reshape(-1)
 
-        # 2) Fallback to min/max
-        if wscale is None:
-            wscale = _symmetric_scale_per_channel(W, qmax=127)
-            wzp = torch.zeros_like(wscale, dtype=torch.int32)
-        if ascale is None or azp is None:
+        # Weight per-tensor scale (collapse if we had per-channel)
+        if w_scale_tensor is not None and w_scale_tensor.numel() > 0:
+            w_scale = float(w_scale_tensor.abs().max().item())
+        else:
+            w_scale = _symmetric_weight_scale_per_tensor(W, qmax=127)
+
+        # Activation per-tensor affine scale/zp
+        if a_scale is None:
             mn, mx = act_ranges.get(name, (-1.0, 1.0))
-            ascale, azp = _affine_scale_zero(mn, mx, qmin=0, qmax=255)
+            a_scale, a_zp = _affine_scale_zero(mn, mx, qmin=0, qmax=255)
+        else:
+            # have a_scale from PTQ4ViT; assume uint8 affine zp=128
+            a_zp = 128
 
         qdq = QDQLinearExport(
             linear=lin,
-            w_scales=wscale.float(),
-            w_zero_points=wzp.int(),
-            a_scale=float(ascale),
-            a_zero_point=int(azp),
-            per_channel=True
+            w_scale=float(max(w_scale, 1e-12)),
+            w_zero_point=0,          # symmetric int8 weights
+            a_scale=float(max(a_scale, 1e-12)),
+            a_zero_point=int(a_zp)
         )
         _set_module_by_name(new_model, name, qdq)
 
@@ -273,14 +236,9 @@ def export_qdq_onnx_from_model(model: nn.Module,
                                input_size: int = 224,
                                onnx_path: str = "model_qdq.onnx",
                                opset: int = 13,
-                               use_symmetric_weight: bool = True,
-                               use_symmetric_act: bool = False,
                                device: str = "cuda"):
     """
-    Convert a calibrated model into a Q/DQ ONNX.
-    - If wrapped_modules provided, try to use its qparams; otherwise use fallback stats.
-    - We only replace nn.Linear (major GEMM hotspots in ViT/DeiT).
-      You can extend similarly for Conv if needed.
+    Convert a calibrated model into a Q/DQ ONNX (weights per-tensor INT8, activations per-tensor UINT8).
     """
     model = model.eval().to(device)
 
