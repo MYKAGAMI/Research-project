@@ -21,4 +21,5 @@ int_weights
 *.pt
 *.pth
 *.onnx
+*.npz*.onnx
 *.npz
