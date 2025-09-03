@@ -18,3 +18,7 @@ ckt
 *.json
 test.ipynb
 int_weights
+*.pt
+*.pth
+*.onnx
+*.npz
