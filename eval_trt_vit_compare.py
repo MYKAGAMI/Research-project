@@ -1,312 +1,294 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+eval_trt_vit_compare.py
+- 自动识别 ImageNet 目录结构：val/<class_id>/*.jpg
+- 可选对比 INT8 与 FP32/TF32 两个 TensorRT engine 的 速度 + 精度
+- 也可只测其中一个 engine
+"""
 
 import os
 import time
 import argparse
-import math
-from collections import deque
+import json
+from typing import List, Tuple, Dict, Optional
 
 import numpy as np
 from PIL import Image
 
-import tensorrt as trt
-import pycuda.autoinit  # noqa: F401
-import pycuda.driver as cuda
+try:
+    import tensorrt as trt
+except Exception as e:
+    raise RuntimeError("需要 TensorRT Python 包（通常随 TensorRT 安装）。") from e
+
+# 尝试使用 PyCUDA（最常见）
+try:
+    import pycuda.autoinit  # noqa: F401
+    import pycuda.driver as cuda
+    HAVE_PYCUDA = True
+except Exception:
+    HAVE_PYCUDA = False
 
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-def preprocess_pil(path, out_h=224, out_w=224):
-    # Resize shorter side to 256, then center crop 224x224, normalize to ImageNet, NCHW float32
-    img = Image.open(path).convert("RGB")
-    w, h = img.size
-    short = 256
-    if h < w:
-        new_h = short
-        new_w = int(round(w * short / h))
-    else:
-        new_w = short
-        new_h = int(round(h * short / w))
-    img = img.resize((new_w, new_h), Image.BILINEAR)
+def log(s): print(s, flush=True)
 
-    left = (new_w - out_w) // 2
-    top  = (new_h - out_h) // 2
-    img = img.crop((left, top, left + out_w, top + out_h))
-
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD   # HWC
-    arr = np.transpose(arr, (2, 0, 1))           # CHW
-    return arr
-
-def load_val_list(list_path, data_root):
+def load_val_list(list_path: str, data_root: str) -> List[Tuple[str, int]]:
+    """从 val_list.txt 读取：(相对/绝对路径, label)"""
     items = []
     with open(list_path, "r") as f:
         for line in f:
             line = line.strip()
-            if not line:
-                continue
-            # support "path label" or "path\tlabel"
-            parts = line.split()
-            if len(parts) < 2:
-                continue
-            rel_path = parts[0]
-            label = int(parts[1])
-            full_path = os.path.join(data_root, rel_path.lstrip("./"))
-            items.append((full_path, label))
+            if not line: continue
+            path, lab = line.split(maxsplit=1)
+            if not os.path.isabs(path):
+                path = os.path.join(data_root, path)
+            items.append((path, int(lab)))
     return items
 
-def topk_correct(logits, labels, ks=(1,5)):
-    # logits: [B, C], labels: [B]
-    pred = np.argsort(-logits, axis=1)  # descending
-    res = {}
-    for k in ks:
-        topk = pred[:, :k]
-        correct = (topk == labels[:, None]).any(axis=1).sum()
-        res[k] = int(correct)
-    return res
+def auto_scan_imagenet_folder(data_root: str) -> Tuple[List[Tuple[str, int]], Dict[str,int], List[str]]:
+    """
+    自动扫描 ImageNet val 目录：data_root/class_id/*.jpg
+    返回：
+      items: [(img_path, label_idx), ...]
+      class_to_idx: {'n01440764': 0, ...}
+      classes: [class_name_sorted]
+    """
+    classes = [d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
+    classes.sort()
+    class_to_idx = {c:i for i,c in enumerate(classes)}
 
-class TrtEngineRunner:
-    def __init__(self, engine_path, batch, input_hw=(224,224)):
-        self.engine_path = engine_path
-        self.batch = batch
-        self.h, self.w = input_hw
+    exts = (".jpg", ".jpeg", ".png", ".bmp")
+    items = []
+    for c in classes:
+        cdir = os.path.join(data_root, c)
+        for root, _, files in os.walk(cdir):
+            for fn in files:
+                if fn.lower().endswith(exts):
+                    items.append((os.path.join(root, fn), class_to_idx[c]))
+    items.sort()
+    return items, class_to_idx, classes
 
-        self.logger = trt.Logger(trt.Logger.ERROR)
-        trt.init_libnvinfer_plugins(self.logger, namespace="")
-        with open(engine_path, "rb") as f, trt.Runtime(self.logger) as runtime:
-            self.engine = runtime.deserialize_cuda_engine(f.read())
-        assert self.engine is not None, f"Failed to load engine: {engine_path}"
-        self.context = self.engine.create_execution_context()
-        assert self.context is not None, "Failed to create execution context"
+def preprocess_image(path: str, size: int = 224) -> np.ndarray:
+    """
+    返回 NCHW float32 预处理图像（1,3,224,224），ImageNet mean/std 归一化
+    """
+    img = Image.open(path).convert("RGB")
+    # 简单的短边缩放 + center crop（与大多数 ViT 推理一致）
+    w, h = img.size
+    scale = size * 256 // 224  # 按 224->256 的常见比率先缩放
+    short = min(w, h)
+    if short != 0:
+        resize_to = int(scale * max(w, h) / short) if short == h else int(scale * max(h, w) / short)
+    else:
+        resize_to = scale
+    # 更稳妥：直接按照短边到 256
+    if w < h:
+        new_w, new_h = 256, int(h * 256 / w)
+    else:
+        new_h, new_w = 256, int(w * 256 / h)
+    img = img.resize((new_w, new_h), Image.BILINEAR)
 
-        # Find bindings
-        self.input_indices = []
-        self.output_indices = []
-        for i in range(self.engine.num_bindings):
-            if self.engine.binding_is_input(i):
-                self.input_indices.append(i)
-            else:
-                self.output_indices.append(i)
-        assert len(self.input_indices) == 1, "Expect exactly 1 input"
-        assert len(self.output_indices) == 1, "Expect exactly 1 output"
-        self.in_idx = self.input_indices[0]
-        self.out_idx = self.output_indices[0]
+    # Center crop 224
+    left = (new_w - size) // 2
+    top  = (new_h - size) // 2
+    img = img.crop((left, top, left + size, top + size))
 
-        # Dynamic shapes?
-        in_shape = self.engine.get_binding_shape(self.in_idx)
-        if -1 in in_shape:
-            # assume NCHW with variable N
-            self.context.set_binding_shape(self.in_idx, (self.batch, 3, self.h, self.w))
-        self.input_shape = tuple(self.context.get_binding_shape(self.in_idx))
-        self.output_shape = tuple(self.context.get_binding_shape(self.out_idx))
-        assert self.input_shape[0] == self.batch, f"Engine batch {self.input_shape[0]} != {self.batch}"
+    arr = (np.array(img).astype(np.float32) / 255.0)
+    arr = (arr - IMAGENET_MEAN) / IMAGENET_STD
+    arr = arr.transpose(2, 0, 1)  # HWC->CHW
+    arr = np.expand_dims(arr, 0)  # NCHW
+    return arr
 
-        # Allocate device buffers
-        self.d_input = cuda.mem_alloc(np.prod(self.input_shape) * np.float32().nbytes)
-        self.d_output = cuda.mem_alloc(np.prod(self.output_shape) * np.float32().nbytes)
-        self.bindings = [None] * self.engine.num_bindings
-        self.bindings[self.in_idx] = int(self.d_input)
-        self.bindings[self.out_idx] = int(self.d_output)
+def build_batches(items: List[Tuple[str,int]], batch: int) -> List[Tuple[List[str], np.ndarray, np.ndarray]]:
+    """
+    将样本打成 batch，返回 [(paths, input_batch, labels_batch), ...]
+    """
+    batches = []
+    for i in range(0, len(items), batch):
+        chunk = items[i:i+batch]
+        paths = [p for p,_ in chunk]
+        labels = np.array([lab for _,lab in chunk], dtype=np.int64)
+        inputs = [preprocess_image(p) for p in paths]
+        x = np.concatenate(inputs, axis=0)  # (N,3,224,224)
+        batches.append((paths, x, labels))
+    return batches
 
-        self.stream = cuda.Stream()
+def load_engine(engine_path: str):
+    TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+    with open(engine_path, "rb") as f, trt.Runtime(TRT_LOGGER) as rt:
+        engine = rt.deserialize_cuda_engine(f.read())
+    return engine
 
-        # Host buffers
-        self.h_input = np.empty(self.input_shape, dtype=np.float32)
-        self.h_output = np.empty(self.output_shape, dtype=np.float32)
+def create_context_and_io(engine):
+    context = engine.create_execution_context()
+    # 假设单输入单输出：
+    assert engine.num_io_tensors == 2, "脚本假设 1 输入 1 输出"
+    names = [engine.get_tensor_name(i) for i in range(engine.num_io_tensors)]
+    input_name  = next(n for n in names if engine.get_tensor_mode(n) == trt.TensorIOMode.INPUT)
+    output_name = next(n for n in names if engine.get_tensor_mode(n) == trt.TensorIOMode.OUTPUT)
+    return context, input_name, output_name
 
-    def infer(self, batch_np):
-        # batch_np: [N,3,224,224] float32
-        assert batch_np.shape == self.input_shape, f"bad input {batch_np.shape} vs {self.input_shape}"
-        cuda.memcpy_htod_async(self.d_input, batch_np, self.stream)
+def alloc_buffers(engine, context, input_name, output_name, batch):
+    # 设置动态 batch（若 engine 是显式 batch）
+    ishape = list(engine.get_tensor_shape(input_name))
+    if ishape[0] == -1:
+        ishape[0] = batch
+    context.set_input_shape(input_name, tuple(ishape))
 
-        start_evt = cuda.Event()
-        end_evt = cuda.Event()
-        start_evt.record(self.stream)
+    input_nbytes  = np.prod(ishape) * np.dtype(np.float32).itemsize
+    oshape = context.get_tensor_shape(output_name)
+    if oshape[0] == -1:
+        # 根据 batch 推断
+        oshape = list(oshape)
+        oshape[0] = batch
+        oshape = tuple(oshape)
+    output_nbytes = np.prod(oshape) * np.dtype(np.float32).itemsize
 
-        self.context.execute_async_v3(self.stream.handle, self.bindings)
+    if not HAVE_PYCUDA:
+        raise RuntimeError(
+            "需要 PyCUDA 以进行 GPU 内存分配与拷贝。请安装：\n"
+            "pip install pycuda --extra-index-url https://pypi.nvidia.com"
+        )
 
-        end_evt.record(self.stream)
-        end_evt.synchronize()
-        gpu_ms = start_evt.time_till(end_evt)  # ms
+    d_input  = cuda.mem_alloc(int(input_nbytes))
+    d_output = cuda.mem_alloc(int(output_nbytes))
+    stream   = cuda.Stream()
+    return d_input, d_output, stream, tuple(oshape)
 
-        cuda.memcpy_dtoh_async(self.h_output, self.d_output, self.stream)
-        self.stream.synchronize()
-        return self.h_output.copy(), gpu_ms
+def infer_batches(engine_path: str, batches, warmup: int, iters: int) -> Dict[str, float]:
+    engine = load_engine(engine_path)
+    context, in_name, out_name = create_context_and_io(engine)
 
-def run_eval(engine_path, data_root, val_list, batch=64, workers=4, warmup=50, iters=200, max_images=None, tag=""):
-    items = load_val_list(val_list, data_root)
-    if max_images:
-        items = items[:max_images]
-    n = len(items)
-    if n == 0:
-        raise RuntimeError("val_list is empty.")
+    # 用首个 batch 的维度进行绑定创建
+    first_batch = batches[0][1]
+    batch = first_batch.shape[0]
+    d_input, d_output, stream, oshape = alloc_buffers(engine, context, in_name, out_name, batch)
 
-    runner = TrtEngineRunner(engine_path, batch=batch, input_hw=(224,224))
+    context.set_tensor_address(in_name, int(d_input))
+    context.set_tensor_address(out_name, int(d_output))
 
-    # Dataloader（简易、CPU 线程数用 workers 控制预取）
-    # 这里用一个简单的预取队列，避免引入 heavy 依赖
-    def batch_iter():
-        buf = []
-        for path, label in items:
-            arr = preprocess_pil(path, 224, 224)
-            buf.append((arr, label))
-            if len(buf) == batch:
-                xs = np.stack([x for x, _ in buf], axis=0).astype(np.float32)
-                ys = np.array([y for _, y in buf], dtype=np.int64)
-                yield xs, ys
-                buf.clear()
-        if buf:
-            # last partial batch -> pad to full
-            pad = batch - len(buf)
-            xs = np.stack([x for x, _ in buf] + [buf[-1][0]]*pad, axis=0).astype(np.float32)
-            ys = np.array([y for _, y in buf] + [buf[-1][1]]*pad, dtype=np.int64)
-            yield xs, ys
+    # 统计
+    total_images = 0
+    correct_top1 = 0
 
-    # Warmup
-    it = 0
-    for xs, _ in batch_iter():
-        _, gpu_ms = runner.infer(xs)
-        it += 1
-        if it >= warmup:
-            break
+    # 预热
+    w = 0
+    while w < warmup:
+        for _, x, _ in batches:
+            if x.shape[0] != batch:
+                # 最后不足 batch 的一组，跳过预热/评测
+                continue
+            cuda.memcpy_htod_async(d_input, x, stream)
+            context.enqueue_v3(stream.handle)
+            stream.synchronize()
+            w += 1
+            if w >= warmup:
+                break
 
-    # Measure
-    lat_ms = []
-    images_done = 0
-    top1 = 0
-    top5 = 0
+    # 计时评测
+    ran = 0
     t0 = time.time()
+    while ran < iters:
+        for _, x, labels in batches:
+            if x.shape[0] != batches[0][1].shape[0]:
+                continue  # 跳过非整 batch
+            cuda.memcpy_htod_async(d_input, x, stream)
+            context.enqueue_v3(stream.handle)
+            # 拷回输出
+            out_host = np.empty(oshape, dtype=np.float32)
+            cuda.memcpy_dtoh_async(out_host, d_output, stream)
+            stream.synchronize()
 
-    measured = 0
-    for xs, ys in batch_iter():
-        if measured >= iters:
-            break
-        logits, gpu_ms = runner.infer(xs)
-        # real size for this batch (avoid counting padded samples)
-        real_b = min(batch, n - images_done) if (images_done + batch) <= n else (n - images_done)
-        if real_b <= 0:
-            break
-        # clip logits/labels to real size
-        logits = logits[:real_b]
-        ys = ys[:real_b]
+            # 计算 top1
+            pred = out_host.argmax(axis=1)
+            correct_top1 += (pred == labels).sum()
+            total_images += labels.shape[0]
 
-        correct = topk_correct(logits, ys, ks=(1,5))
-        top1 += correct[1]
-        top5 += correct[5]
-        images_done += real_b
-
-        lat_ms.append(gpu_ms)
-        measured += 1
-
+            ran += 1
+            if ran >= iters:
+                break
     t1 = time.time()
-    wall_s = t1 - t0
-    imgs = images_done
-    top1_acc = top1 / imgs * 100.0
-    top5_acc = top5 / imgs * 100.0
+    wall = t1 - t0
 
-    if len(lat_ms) == 0:
-        raise RuntimeError("No measurements collected. Increase --iters or check val_list.")
-
-    lat_arr = np.array(lat_ms, dtype=np.float64)
-    mean_ms = float(lat_arr.mean())
-    p50_ms = float(np.percentile(lat_arr, 50))
-    p90_ms = float(np.percentile(lat_arr, 90))
-    p95_ms = float(np.percentile(lat_arr, 95))
-    p99_ms = float(np.percentile(lat_arr, 99))
-    # Per-batch GPU ms -> per-image
-    mean_ms_per_img = mean_ms / batch
-    throughput = imgs / wall_s
-
-    result = {
-        "tag": tag,
-        "engine": engine_path,
-        "images": imgs,
-        "batches_measured": measured,
-        "batch": batch,
-        "gpu_ms_per_batch_mean": mean_ms,
-        "gpu_ms_per_img_mean": mean_ms_per_img,
-        "gpu_ms_p50": p50_ms,
-        "gpu_ms_p90": p90_ms,
-        "gpu_ms_p95": p95_ms,
-        "gpu_ms_p99": p99_ms,
-        "throughput_ips_wall": throughput,
-        "top1": top1_acc,
-        "top5": top5_acc,
-        "wall_seconds": wall_s,
+    throughput = total_images / wall if wall > 0 else 0.0
+    top1 = correct_top1 / total_images if total_images > 0 else 0.0
+    return {
+        "images": int(total_images),
+        "correct": int(correct_top1),
+        "top1": float(top1),
+        "time_sec": float(wall),
+        "throughput_ips": float(throughput),
+        "batch": int(batches[0][1].shape[0]),
     }
-    return result
-
-def print_result_table(res_list):
-    # Pretty print
-    def fmt(x, n=3):
-        return f"{x:.{n}f}"
-    print("\n=== Results ===")
-    header = [
-        "Tag", "Top1(%)", "Top5(%)",
-        "GPU ms/b(mean)", "GPU ms/img", "p50", "p90", "p95", "p99",
-        "Throughput(img/s)", "Images", "Batch", "Wall(s)"
-    ]
-    print("\t".join(header))
-    for r in res_list:
-        row = [
-            r["tag"],
-            fmt(r["top1"], 2), fmt(r["top5"], 2),
-            fmt(r["gpu_ms_per_batch_mean"]), fmt(r["gpu_ms_per_img_mean"]),
-            fmt(r["gpu_ms_p50"]), fmt(r["gpu_ms_p90"]), fmt(r["gpu_ms_p95"]), fmt(r["gpu_ms_p99"]),
-            fmt(r["throughput_ips_wall"]), str(r["images"]), str(r["batch"]), fmt(r["wall_seconds"])
-        ]
-        print("\t".join(row))
-    # If have two results, print speedup
-    if len(res_list) == 2:
-        a, b = res_list
-        # define speedup: per-image GPU latency or wall throughput
-        sp_lat = a["gpu_ms_per_img_mean"] / b["gpu_ms_per_img_mean"]
-        sp_thr = b["throughput_ips_wall"] / a["throughput_ips_wall"]
-        print("\nSpeedup ({} -> {}):".format(a["tag"], b["tag"]))
-        print(f"- GPU latency per image: x{sp_lat:.2f} (smaller is better)")
-        print(f"- Wall throughput (img/s): x{sp_thr:.2f} (larger is better)")
 
 def main():
-    ap = argparse.ArgumentParser("TRT ViT INT8 vs FP32/TF32 - Speed & Accuracy")
-    ap.add_argument("--int8-engine", type=str, default=None, help="INT8 engine path (*.plan)")
-    ap.add_argument("--fp32-engine", type=str, default=None, help="FP32/TF32 engine path (*.plan)")
-    ap.add_argument("--data-root", type=str, required=True)
-    ap.add_argument("--val-list", type=str, required=True)
+    ap = argparse.ArgumentParser("TensorRT ViT INT8 vs FP32/TF32 速度+精度对比")
+    ap.add_argument("--int8-engine", type=str, default=None, help="INT8 engine .plan 路径")
+    ap.add_argument("--fp32-engine", type=str, default=None, help="FP32/TF32 engine .plan 路径")
+    ap.add_argument("--data-root", type=str, required=True, help="验证集根目录（val/；按子目录=类别组织）")
+    ap.add_argument("--val-list", type=str, default=None, help="可选：val_list.txt（path label），若给定则优先生效")
     ap.add_argument("--batch", type=int, default=64)
-    ap.add_argument("--workers", type=int, default=4, help="(placeholder) kept for interface, not used heavily")
+    ap.add_argument("--workers", type=int, default=8)  # 兼容参数，不实际使用
     ap.add_argument("--warmup", type=int, default=50)
-    ap.add_argument("--iters", type=int, default=200, help="measured batches")
-    ap.add_argument("--max-images", type=int, default=None)
+    ap.add_argument("--iters", type=int, default=200)
+    ap.add_argument("--max-samples", type=int, default=50000, help="最多使用多少样本（默认 50k）")
     args = ap.parse_args()
 
-    res = []
-    if args.int8_engine is None and args.fp32_engine is None:
-        raise SystemExit("Please provide at least one engine: --int8-engine or --fp32-engine")
+    assert args.int8_engine or args.fp32_engine, "至少指定一个 engine"
+
+    # 构建样本列表
+    if args.val_list and os.path.isfile(args.val_list):
+        log(f"[Info] 使用 val_list.txt: {args.val_list}")
+        items = load_val_list(args.val_list, args.data_root)
+        classes = None
+    else:
+        log(f"[Info] 自动扫描 ImageNet 目录: {args.data_root}")
+        items, class_to_idx, classes = auto_scan_imagenet_folder(args.data_root)
+        log(f"[Info] 类别数: {len(classes)}，样本数: {len(items)}")
+        # 保存个 mapping 方便复现
+        mapping_path = os.path.join(os.path.dirname(__file__), "imagenet_classes.json")
+        try:
+            with open(mapping_path, "w") as f:
+                json.dump({"classes": classes, "class_to_idx": class_to_idx}, f, indent=2)
+            log(f"[Info] 已保存类别映射到 {mapping_path}")
+        except Exception:
+            pass
+
+    if len(items) == 0:
+        raise RuntimeError("没有找到任何图片。请检查 --data-root 是否正确。")
+
+    # 限制样本数以控制评测时长
+    items = items[:args.max_samples]
+
+    # 打 batch（最后不足 batch 的一组将被跳过）
+    batches = build_batches(items, args.batch)
+    if len(batches) == 0:
+        raise RuntimeError("有效 batch 数为 0。请减小 --batch 或检查数据。")
+    log(f"[Info] 可用整批数量: {len(batches)}（将跳过最后不足 {args.batch} 的批次）")
+
+    results = {}
+    if args.int8_engine:
+        log("\n===== 评测 INT8 Engine =====")
+        r = infer_batches(args.int8_engine, batches, args.warmup, args.iters)
+        results["INT8"] = r
+        log(json.dumps({"INT8": r}, indent=2, ensure_ascii=False))
 
     if args.fp32_engine:
-        r = run_eval(
-            args.fp32_engine, args.data_root, args.val_list,
-            batch=args.batch, workers=args.workers,
-            warmup=args.warmup, iters=args.iters, max_images=args.max_images, tag="FP32/TF32"
-        )
-        res.append(r)
-        print_result_table([r])
+        log("\n===== 评测 FP32/TF32 Engine =====")
+        r = infer_batches(args.fp32_engine, batches, args.warmup, args.iters)
+        results["FP32/TF32"] = r
+        log(json.dumps({"FP32/TF32": r}, indent=2, ensure_ascii=False))
 
-    if args.int8_engine:
-        r = run_eval(
-            args.int8_engine, args.data_root, args.val_list,
-            batch=args.batch, workers=args.workers,
-            warmup=args.warmup, iters=args.iters, max_images=args.max_images, tag="INT8"
-        )
-        res.append(r)
-        if len(res) == 2:
-            # print both and speedup
-            # ensure order: FP32 first then INT8 for speedup display
-            res_sorted = sorted(res, key=lambda x: 0 if x["tag"] == "FP32/TF32" else 1)
-            print_result_table(res_sorted)
-        else:
-            print_result_table([r])
+    # 汇总对比
+    log("\n===== 汇总对比 =====")
+    def brief(r):
+        return f"top1={r['top1']*100:.2f}% | throughput={r['throughput_ips']:.1f} img/s | images={r['images']} | time={r['time_sec']:.2f}s"
+    if "INT8" in results:
+        log(f"INT8      : {brief(results['INT8'])}")
+    if "FP32/TF32" in results:
+        log(f"FP32/TF32 : {brief(results['FP32/TF32'])}")
 
 if __name__ == "__main__":
     main()
